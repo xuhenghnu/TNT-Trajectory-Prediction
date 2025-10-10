@@ -1,0 +1,6 @@
+{
+  "python.analysis.extraPaths": [
+    "/home/user/work/argoverse-api"
+  ],
+  "ros.distro": "melodic"
+}

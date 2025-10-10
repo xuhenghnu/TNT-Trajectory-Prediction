@@ -4,7 +4,7 @@
 
 import os
 import argparse
-from os.path import join as pjoin
+from os.path import join
 import copy
 import sys
 import numpy as np
@@ -12,6 +12,7 @@ import pandas as pd
 from tqdm import tqdm
 from matplotlib import pyplot as plt
 from scipy import sparse
+from pathlib import Path
 
 import warnings
 
@@ -23,47 +24,60 @@ from argoverse.map_representation.map_api import ArgoverseMap
 from argoverse.visualization.visualize_sequences import viz_sequence
 from argoverse.utils.mpl_plotting_utils import visualize_centerline
 
-from core.util.preprocessor.base import Preprocessor
+
 from core.util.cubic_spline import Spline2D
+
+# 当前文件路径
+current_file = Path(__file__).resolve()
+project_root = current_file.parent.parent.parent.parent
+print('project_root: ', project_root)
 
 warnings.filterwarnings("ignore")
 
 RESCALE_LENGTH = 1.0    # the rescale length th turn the lane vector into equal distance pieces
 
 
-class ArgoversePreprocessor(Preprocessor):
+class ArgoversePreprocessor(Dataset):
     def __init__(self,
-                 root_dir,
-                 split="train",
-                 algo="tnt",
-                 obs_horizon=20,
-                 obs_range=100,
-                 pred_horizon=30,
-                 normalized=True,
-                 save_dir=None):
-        super(ArgoversePreprocessor, self).__init__(root_dir, algo, obs_horizon, obs_range, pred_horizon)
+                 param_dict,
+                 split="train"):
+        
+        self.raw_dir = param_dict['raw_dir']
+        self.save_dir = param_dict['save_dir']
+        self.obs_horizon = param_dict['obs_horizon']
+        self.obs_range = param_dict['obs_range']
+        self.pred_horizon = param_dict['pred_horizon']
+        self.normalized = param_dict['normalized']
+        self.map_feat = True
 
         self.LANE_WIDTH = {'MIA': 3.84, 'PIT': 3.97}
         self.COLOR_DICT = {"AGENT": "#d33e4c", "OTHERS": "#d3e8ef", "AV": "#007672"}
 
         self.split = split
-        self.normalized = normalized
 
+        # Argoverse数据集的地图
         self.am = ArgoverseMap()
-        self.loader = ArgoverseForecastingLoader(pjoin(self.root_dir, self.split+"_obs" if split == "test" else split))
+        # ArgoverseForecasting数据集的api接口
+        self.afl = ArgoverseForecastingLoader(os.path.join(self.raw_dir, self.split+"_obs" if split == "test" else split))
 
-        self.save_dir = save_dir
+    # DataSet必须重写__len__和__getitem__
+    def __len__(self):
+        return len(self.afl)
 
     def __getitem__(self, idx):
-        f_path = self.loader.seq_list[idx]
-        seq = self.loader.get(f_path)
+        f_path = self.afl.seq_list[idx]  # 获取数据集中的第idx条数据路径
+        # 通过ArgoverseForecasting的loader获取当前csv文件的数据，存储在seq，包含原始数据及一些处理后的结果
+        seq = self.afl.get(f_path)
+        # 拆分出路径，文件名，后缀名
         path, seq_f_name_ext = os.path.split(f_path)
-        seq_f_name, ext = os.path.splitext(seq_f_name_ext)
-
+        seq_f_name, ext = os.path.splitext(seq_f_name_ext)  # 
+        # 原始数据是存在seq.seq_df中的，shape =（row, 6)，timestamp, track_id, object_type, x, y, city 
         df = copy.deepcopy(seq.seq_df)
-        return self.process_and_save(df, seq_id=seq_f_name, dir_=self.save_dir)
+        df_processed = self.process(df, seq_f_name, self.map_feat)
+        self.save(df_processed, seq_f_name, self.save_dir)
+        return []
 
-    def process(self, dataframe: pd.DataFrame,  seq_id, map_feat=True):
+    def process(self, dataframe: pd.DataFrame, seq_id, map_feat=True):
         data = self.read_argo_data(dataframe)
         data = self.get_obj_feats(data)
 
@@ -75,9 +89,23 @@ class ArgoversePreprocessor(Preprocessor):
             [[data[key] for key in data.keys()]],
             columns=[key for key in data.keys()]
         )
+    
+    def save(self, dataframe: pd.DataFrame, file_name, dir_=None):
+        if not isinstance(dataframe, pd.DataFrame):
+            print('dataframe is not pd.DataFrame')
+            return
 
-    def __len__(self):
-        return len(self.loader)
+        if not dir_:
+            dir_ = os.path.join(os.path.split(self.raw_dir)[0], "intermediate", self.split + "_intermediate", "raw")
+        else:
+            dir_ = os.path.join(dir_, self.split + "_intermediate", "raw")
+
+        if not os.path.exists(dir_):
+            os.makedirs(dir_)
+
+        fname = f"features_{file_name}.pkl"
+        dataframe.to_pickle(os.path.join(dir_, fname))
+        # print("[Preprocessor]: Saving data to {} with name: {}...".format(dir_, fname))
 
     @staticmethod
     def read_argo_data(df: pd.DataFrame):
@@ -92,27 +120,31 @@ class ArgoversePreprocessor(Preprocessor):
         trajs = np.concatenate((
             df.X.to_numpy().reshape(-1, 1),
             df.Y.to_numpy().reshape(-1, 1)), 1)
-
+        # 将时间戳转换为索引
         steps = [mapping[x] for x in df['TIMESTAMP'].values]
         steps = np.asarray(steps, np.int64)
-
+        # 每个障碍物轨迹的位置（行数）索引，每个障碍物50个轨迹点
         objs = df.groupby(['TRACK_ID', 'OBJECT_TYPE']).groups
         keys = list(objs.keys())
         obj_type = [x[1] for x in keys]
 
-        agt_idx = obj_type.index('AGENT')
+        agt_idx = obj_type.index('AGENT')       
+        # 获取所有Agent的轨迹位置索引
         idcs = objs[keys[agt_idx]]
 
+        # 获取agent轨迹点，step表示了障碍物存在的时间戳索引
         agt_traj = trajs[idcs]
         agt_step = steps[idcs]
 
         del keys[agt_idx]
         ctx_trajs, ctx_steps = [], []
+        # 获取其他障碍物轨迹点
         for key in keys:
             idcs = objs[key]
             ctx_trajs.append(trajs[idcs])
             ctx_steps.append(steps[idcs])
 
+        # 把agt_traj提出来就是为了将他放到最前面，可以通过列的交换实现
         data = dict()
         data['city'] = city
         data['trajs'] = [agt_traj] + ctx_trajs
@@ -121,9 +153,11 @@ class ArgoversePreprocessor(Preprocessor):
 
     def get_obj_feats(self, data):
         # get the origin and compute the oritentation of the target agent
+        # 以第一个agent输入轨迹的最后一个点作为原点
         orig = data['trajs'][0][self.obs_horizon-1].copy().astype(np.float32)
 
         # comput the rotation matrix
+        # 根据车道方向旋转坐标？
         if self.normalized:
             pre, conf = self.am.get_lane_direction(data['trajs'][0][self.obs_horizon-1], data['city'])
             if conf <= 0.1:
@@ -140,6 +174,7 @@ class ArgoversePreprocessor(Preprocessor):
                 [0.0, 1.0]], np.float32)
 
         # get the target candidates and candidate gt
+        # agt_traj_obs没有旋转坐标？
         agt_traj_obs = data['trajs'][0][0: self.obs_horizon].copy().astype(np.float32)
         agt_traj_fut = data['trajs'][0][self.obs_horizon:self.obs_horizon+self.pred_horizon].copy().astype(np.float32)
         ctr_line_candts = self.am.get_candidate_centerlines_for_traj(agt_traj_obs, data['city'], viz=False)
@@ -155,12 +190,10 @@ class ArgoversePreprocessor(Preprocessor):
             tar_candts_gt, tar_offse_gt = np.zeros((tar_candts.shape[0], 1)), np.zeros((1, 2))
             splines, ref_idx = None, None
         else:
+            # 获取真值对应的车道
             splines, ref_idx = self.get_ref_centerline(ctr_line_candts, agt_traj_fut)
+            # 获取真值对应的候选点和offset
             tar_candts_gt, tar_offse_gt = self.get_candidate_gt(tar_candts, agt_traj_fut[-1])
-
-        # self.plot_target_candidates(ctr_line_candts, agt_traj_obs, agt_traj_fut, tar_candts)
-        # if not np.all(offse_gt < self.LANE_WIDTH[data['city']]):
-        #     self.plot_target_candidates(ctr_line_candts, agt_traj_obs, agt_traj_fut, tar_candts)
 
         feats, ctrs, has_obss, gt_preds, has_preds = [], [], [], [], []
         x_min, x_max, y_min, y_max = -self.obs_range, self.obs_range, -self.obs_range, self.obs_range
@@ -173,7 +206,7 @@ class ArgoversePreprocessor(Preprocessor):
 
             # collect the future prediction ground truth
             gt_pred = np.zeros((self.pred_horizon, 2), np.float32)
-            has_pred = np.zeros(self.pred_horizon, np.bool)
+            has_pred = np.zeros(self.pred_horizon, np.bool_)
             future_mask = np.logical_and(step >= self.obs_horizon, step < self.obs_horizon + self.pred_horizon)
             post_step = step[future_mask] - self.obs_horizon
             post_traj = traj_nd[future_mask]
@@ -198,7 +231,7 @@ class ArgoversePreprocessor(Preprocessor):
                 continue
 
             feat = np.zeros((self.obs_horizon, 3), np.float32)
-            has_obs = np.zeros(self.obs_horizon, np.bool)
+            has_obs = np.zeros(self.obs_horizon, np.bool_)
 
             feat[step_obs, :2] = traj_obs
             feat[step_obs, 2] = 1.0
@@ -216,9 +249,9 @@ class ArgoversePreprocessor(Preprocessor):
         #     raise Exception()
 
         feats = np.asarray(feats, np.float32)
-        has_obss = np.asarray(has_obss, np.bool)
+        has_obss = np.asarray(has_obss, np.bool_)
         gt_preds = np.asarray(gt_preds, np.float32)
-        has_preds = np.asarray(has_preds, np.bool)
+        has_preds = np.asarray(has_preds, np.bool_)
 
         # plot the splines
         # self.plot_reference_centerlines(ctr_line_candts, splines, feats[0], gt_preds[0], ref_idx)
@@ -311,39 +344,58 @@ class ArgoversePreprocessor(Preprocessor):
 
         return graph
 
-    def visualize_data(self, data):
+    @staticmethod
+    def uniform_candidate_sampling(sampling_range, rate=30):
         """
-        visualize the extracted data, and exam the data
+        uniformly sampling of the target candidate
+        :param sampling_range: int, the maximum range of the sampling
+        :param rate: the sampling rate (num. of samples)
+        return rate^2 candidate samples
         """
-        fig = plt.figure(0, figsize=(8, 7))
-        fig.clear()
+        x = np.linspace(-sampling_range, sampling_range, rate)
+        return np.stack(np.meshgrid(x, x), -1).reshape(-1, 2)
 
-        # visualize the centerlines
-        lines_ctrs = data['graph']['ctrs']
-        lines_feats = data['graph']['feats']
-        lane_idcs = data['graph']['lane_idcs']
-        for i in np.unique(lane_idcs):
-            line_ctr = lines_ctrs[lane_idcs == i]
-            line_feat = lines_feats[lane_idcs == i]
-            line_str = (2.0 * line_ctr - line_feat) / 2.0
-            line_end = (2.0 * line_ctr[-1, :] + line_feat[-1, :]) / 2.0
-            line = np.vstack([line_str, line_end.reshape(-1, 2)])
-            visualize_centerline(line)
+    # implement a candidate sampling with equal distance;
+    def lane_candidate_sampling(self, centerline_list, orig, distance=0.5, viz=False):
+        """the input are list of lines, each line containing"""
+        candidates = []
+        for lane_id, line in enumerate(centerline_list):
+            sp = Spline2D(x=line[:, 0], y=line[:, 1])
+            s_o, d_o = sp.calc_frenet_position(orig[0], orig[1])
+            s = np.arange(s_o, sp.s[-1], distance)
+            ix, iy = sp.calc_global_position_online(s)
+            candidates.append(np.stack([ix, iy], axis=1))
+        candidates = np.unique(np.concatenate(candidates), axis=0)
 
-        # visualize the trajectory
-        trajs = data['feats'][:, :, :2]
-        has_obss = data['has_obss']
-        preds = data['gt_preds']
-        has_preds = data['has_preds']
-        for i, [traj, has_obs, pred, has_pred] in enumerate(zip(trajs, has_obss, preds, has_preds)):
-            self.plot_traj(traj[has_obs], pred[has_pred], i)
+        if viz:
+            fig = plt.figure(0, figsize=(8, 7))
+            fig.clear()
+            for centerline_coords in centerline_list:
+                visualize_centerline(centerline_coords)
+            plt.scatter(candidates[:, 0], candidates[:, 1], marker="*", c="g", alpha=1, s=6.0, zorder=15)
+            plt.xlabel("Map X")
+            plt.ylabel("Map Y")
+            plt.axis("off")
+            plt.title("No. of lane candidates = {}; No. of target candidates = {};".format(len(centerline_list), len(candidates)))
+            plt.show()
 
-        plt.xlabel("Map X")
-        plt.ylabel("Map Y")
-        plt.axis("off")
-        plt.show()
-        # plt.show(block=False)
-        # plt.pause(0.5)
+        return candidates
+
+    @staticmethod
+    def get_candidate_gt(target_candidate, gt_target):
+        """
+        find the target candidate closest to the gt and output the one-hot ground truth
+        :param target_candidate, (N, 2) candidates
+        :param gt_target, (1, 2) the coordinate of final target
+        """
+        displacement = gt_target - target_candidate
+        gt_index = np.argmin(np.power(displacement[:, 0], 2) + np.power(displacement[:, 1], 2))
+
+        onehot = np.zeros((target_candidate.shape[0], 1))
+        onehot[gt_index] = 1
+
+        offset_xy = gt_target - target_candidate[gt_index]
+        return onehot, offset_xy
 
     @staticmethod
     def get_ref_centerline(cline_list, pred_gt):
@@ -362,6 +414,35 @@ class ArgoversePreprocessor(Preprocessor):
                 min_distances.append(np.min(dis))
             line_idx = np.argmin(min_distances)
             return ref_centerlines, line_idx
+
+    # 绘图
+    @staticmethod
+    def plot_target_candidates(candidate_centerlines, traj_obs, traj_fut, candidate_targets):
+        fig = plt.figure(1, figsize=(8, 7))
+        fig.clear()
+
+        # plot centerlines
+        for centerline_coords in candidate_centerlines:
+            visualize_centerline(centerline_coords)
+
+        # plot traj
+        plt.plot(traj_obs[:, 0], traj_obs[:, 1], "x-", color="#d33e4c", alpha=1, linewidth=1, zorder=15)
+        # plot end point
+        plt.plot(traj_obs[-1, 0], traj_obs[-1, 1], "o", color="#d33e4c", alpha=1, markersize=6, zorder=15)
+        # plot future traj
+        plt.plot(traj_fut[:, 0], traj_fut[:, 1], "+-", color="b", alpha=1, linewidth=1, zorder=15)
+
+        # plot target sample
+        plt.scatter(candidate_targets[:, 0], candidate_targets[:, 1], marker="*", c="green", alpha=1, s=6, zorder=15)
+
+        plt.xlabel("Map X")
+        plt.ylabel("Map Y")
+        plt.axis("off")
+        plt.title("No. of lane candidates = {}; No. of target candidates = {};".format(len(candidate_centerlines),
+                                                                                       len(candidate_targets)))
+        # plt.show(block=False)
+        # plt.pause(0.01)
+        plt.show()
 
     def plot_reference_centerlines(self, cline_list, splines, obs, pred, ref_line_idx):
         fig = plt.figure(0, figsize=(8, 7))
@@ -401,6 +482,39 @@ class ArgoversePreprocessor(Preprocessor):
         else:
             plt.text(pred[-1, 0], pred[-1, 1], "{}_e".format(traj_na))
 
+    def visualize_data(self, data):
+        """
+        visualize the extracted data, and exam the data
+        """
+        fig = plt.figure(0, figsize=(8, 7))
+        fig.clear()
+
+        # visualize the centerlines
+        lines_ctrs = data['graph']['ctrs']
+        lines_feats = data['graph']['feats']
+        lane_idcs = data['graph']['lane_idcs']
+        for i in np.unique(lane_idcs):
+            line_ctr = lines_ctrs[lane_idcs == i]
+            line_feat = lines_feats[lane_idcs == i]
+            line_str = (2.0 * line_ctr - line_feat) / 2.0
+            line_end = (2.0 * line_ctr[-1, :] + line_feat[-1, :]) / 2.0
+            line = np.vstack([line_str, line_end.reshape(-1, 2)])
+            visualize_centerline(line)
+
+        # visualize the trajectory
+        trajs = data['feats'][:, :, :2]
+        has_obss = data['has_obss']
+        preds = data['gt_preds']
+        has_preds = data['has_preds']
+        for i, [traj, has_obs, pred, has_pred] in enumerate(zip(trajs, has_obss, preds, has_preds)):
+            self.plot_traj(traj[has_obs], pred[has_pred], i)
+
+        plt.xlabel("Map X")
+        plt.ylabel("Map Y")
+        plt.axis("off")
+        plt.show()
+        # plt.show(block=False)
+        # plt.pause(0.5)
 
 def ref_copy(data):
     if isinstance(data, list):
@@ -414,29 +528,34 @@ def ref_copy(data):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-r", "--root", type=str, default="../dataset")
-    parser.add_argument("-d", "--dest", type=str, default="../dataset")
-    parser.add_argument("-s", "--small", action='store_true', default=False)
-    args = parser.parse_args()
-
-    # args.root = "/home/jb/projects/Code/trajectory-prediction/TNT-Trajectory-Predition/dataset"
-    raw_dir = os.path.join(args.root, "raw_data")
-    interm_dir = os.path.join(args.dest, "interm_data" if not args.small else "interm_data_small")
+    param_dict = {
+    'raw_dir': 'dataset/raw_data_test',          # root directory stored the dataset
+    'save_dir':  'dataset/interm_data_test',
+    'batch_size': 1,
+    'num_workers': 1,
+    'algo': 'tnt',
+    'obs_horizon': 20,          # the number of timestampe for observation
+    'obs_range': 100,       # the observation range
+    'pred_horizon': 30,     # the number of timestamp for prediction
+    'normalized': True
+    }
+    
+    small = False
 
     for split in ["train", "val", "test"]:
-        # construct the preprocessor and dataloader
-        argoverse_processor = ArgoversePreprocessor(root_dir=raw_dir, split=split, save_dir=interm_dir)
+        # 构建DataSet
+        argoverse_processor = ArgoversePreprocessor(param_dict=param_dict, split=split)
+        # 构建DataLoader, ArgoversePreprocessor类继承了DataSet，所以作为DataLoader的输入
         loader = DataLoader(argoverse_processor,
-                            batch_size=1 if sys.gettrace() else 16,     # 1 batch in debug mode
-                            num_workers=0 if sys.gettrace() else 16,    # use only 0 worker in debug mode
+                            batch_size=param_dict['batch_size'],
+                            num_workers=param_dict['num_workers'],
                             shuffle=False,
                             pin_memory=False,
                             drop_last=False)
 
         for i, data in enumerate(tqdm(loader)):
-            if args.small:
-                if split == "train" and i >= 200:
+            if small:
+                if split == "train" and i >=0:
                     break
                 elif split == "val" and i >= 50:
                     break
