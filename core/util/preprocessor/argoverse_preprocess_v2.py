@@ -65,24 +65,64 @@ class ArgoversePreprocessor(Dataset):
         return len(self.afl)
 
     def __getitem__(self, idx):
-        f_path = self.afl.seq_list[idx]  # 获取数据集中的第idx条数据路径
-        # 通过ArgoverseForecasting的loader获取当前csv文件的数据，存储在seq，包含原始数据及一些处理后的结果
+        # 获取数据集中的第idx条数据路径
+        # API： 在ArgoverseForecastingLoader初始化时会将所有的csv文件路径存储在seq_list中
+        f_path = self.afl.seq_list[idx] 
+        # 获取数据集中的第idx条数据
+        # API： 返回的是ArgoverseForecastingLoader对象，并将该对象的current_seq设置为第idx条数据
         seq = self.afl.get(f_path)
-        # 拆分出路径，文件名，后缀名
-        path, seq_f_name_ext = os.path.split(f_path)
-        seq_f_name, ext = os.path.splitext(seq_f_name_ext)  # 
-        # 原始数据是存在seq.seq_df中的，shape =（row, 6)，timestamp, track_id, object_type, x, y, city 
+        # 数据做一个拷贝到df
+        # API： seq_df返回的是通过Pandas读取的csv文件内容，数据结构是DataFrame
         df = copy.deepcopy(seq.seq_df)
+        # 拆分出路径，文件名（就是seq_id），后缀名
+        path, seq_f_name_ext = os.path.split(f_path)
+        seq_f_name, ext = os.path.splitext(seq_f_name_ext)
+        # 处理数据，也就是训练用的数据
         df_processed = self.process(df, seq_f_name, self.map_feat)
+        # 保存处理后的数据，也就是训练用的数据
         self.save(df_processed, seq_f_name, self.save_dir)
         return []
 
     def process(self, dataframe: pd.DataFrame, seq_id, map_feat=True):
+        # 提取AGENT和其他目标的轨迹，以及数据所在城市（没有障碍物类型，这个数据集没有区分类型）
         data = self.read_argo_data(dataframe)
+        # 提取目标的其他数据
         data = self.get_obj_feats(data)
-
+        # 提取地图属性（主要是车道属性）
         data['graph'] = self.get_lane_graph(data)
         data['seq_id'] = seq_id
+        
+        '''
+        data = {
+            'trajs': [traj1, traj2, traj3, ...],
+            'steps': [step1, step2, step3, ...],
+            'city': 'MIA',
+            'orig': 坐标转换的原点（地图坐标系下）
+            'theta': 坐标转换的角度（地图坐标系下）
+            'rot': 旋转矩阵
+            'feats': 所有目标坐标转换后的观测轨迹 Nx3(最后一列是1.0,有点像置信度)
+            'has_obss': 标记所有目标的这些时间步的观测轨迹点存在
+            'gt_preds': 所有目标坐标转换后的预测轨迹真值 Nx2
+            'has_preds': 标记所有目标的这些时间步的预测轨迹点存在
+            'tar_candts': 候选点
+            'gt_candts': 候选点真值
+            'gt_tar_offset': 候选点偏移真值
+            'ref_ctr_lines': 所有中心线的拟合曲线
+            'ref_cetr_idx': 预测轨迹所在的车道线的索引
+            'graph': {
+              "ctrs": 所有车道中心线每段的中心点
+              "num_nodes": 所有车道线段中点的总数
+              "feats": 所有车道中心线每段的方向
+              "turn": 所有车道的转向类型
+              "control": 所有车道是否有红绿灯
+              "intersect": 所有车道是否在路口
+              "lane_idcs": 每个节点对应的车道编号（长度 = 总节点数， 节点是车道中心线线段）
+            }
+            'seq_id': 数据id(表明是哪条数据)
+            ...
+        }
+        '''
+        
         # visualization for debug purpose
         # self.visualize_data(data)
         return pd.DataFrame(
@@ -109,33 +149,38 @@ class ArgoversePreprocessor(Dataset):
 
     @staticmethod
     def read_argo_data(df: pd.DataFrame):
-        city = df["CITY_NAME"].values[0]
+        """TIMESTAMP, TRACK_ID, OBJECT_TYPE, X, Y, CITY_NAME"""
 
-        """TIMESTAMP,TRACK_ID,OBJECT_TYPE,X,Y,CITY_NAME"""
+        # 获取城市
+        city = df["CITY_NAME"].values[0]
+        # 剔除重复的时间戳并进行排序（np.unique其实已经默认升序，np.sort只是稳妥起见）
         agt_ts = np.sort(np.unique(df['TIMESTAMP'].values))
+        # 给每个时间戳一个索引
         mapping = dict()
         for i, ts in enumerate(agt_ts):
             mapping[ts] = i
-
+        # 将轨迹合成为二维数组N行2列（-1表示自动计算行数，第二个参数 1 表示 沿列方向（横向）拼接）
         trajs = np.concatenate((
-            df.X.to_numpy().reshape(-1, 1),
-            df.Y.to_numpy().reshape(-1, 1)), 1)
-        # 将时间戳转换为索引
+            df["X"].to_numpy().reshape(-1, 1),
+            df["Y"].to_numpy().reshape(-1, 1)), 1)
+        # 将时间戳转换为时间序列的索引（可能是乱序且重复的）
         steps = [mapping[x] for x in df['TIMESTAMP'].values]
         steps = np.asarray(steps, np.int64)
-        # 每个障碍物轨迹的位置（行数）索引，每个障碍物50个轨迹点
+        # 找出所有的目标，并记录哪些行是某个目标的
+        # objs是一个字典，键是[TRACK_ID， OBJECT_TYPE]，值是对应该目标的行
         objs = df.groupby(['TRACK_ID', 'OBJECT_TYPE']).groups
+        # 得到所有的目标类型
         keys = list(objs.keys())
         obj_type = [x[1] for x in keys]
-
+        # 获取Agent对应的数据行
         agt_idx = obj_type.index('AGENT')       
-        # 获取所有Agent的轨迹位置索引
         idcs = objs[keys[agt_idx]]
 
-        # 获取agent轨迹点，step表示了障碍物存在的时间戳索引
+        # 获取agent轨迹点，step表示每一行数据在时间序列里的索引（这里缺少去重和排序！！！）
         agt_traj = trajs[idcs]
         agt_step = steps[idcs]
 
+        # 相当于删除AGENT数据，然后处理其他数据
         del keys[agt_idx]
         ctx_trajs, ctx_steps = [], []
         # 获取其他障碍物轨迹点
@@ -145,6 +190,7 @@ class ArgoversePreprocessor(Dataset):
             ctx_steps.append(steps[idcs])
 
         # 把agt_traj提出来就是为了将他放到最前面，可以通过列的交换实现
+        # 记录下step可能是在后面的处理中用于去重和排序
         data = dict()
         data['city'] = city
         data['trajs'] = [agt_traj] + ctx_trajs
@@ -152,17 +198,17 @@ class ArgoversePreprocessor(Dataset):
         return data
 
     def get_obj_feats(self, data):
-        # get the origin and compute the oritentation of the target agent
-        # 以第一个agent输入轨迹的最后一个点作为原点
+        # 以Agent（也就是要预测的目标）的历史轨迹的最后一个点作为原点
+        # 这个点相当于实际使用时Agent的当前位置，以此为坐标原点可以保证预测时各观测数据在尺度上的一致性与统一性
         orig = data['trajs'][0][self.obs_horizon-1].copy().astype(np.float32)
 
-        # comput the rotation matrix
-        # 根据车道方向旋转坐标？
+        # 计算旋转矩阵（此处分为旋转和不旋转，旋转就按车道方向，因为也没有Agent的角度）
         if self.normalized:
+            # 获取原点对应车道中心线位置的切线向量及其置信度
             pre, conf = self.am.get_lane_direction(data['trajs'][0][self.obs_horizon-1], data['city'])
             if conf <= 0.1:
-                pre = (orig - data['trajs'][0][self.obs_horizon-4]) / 2.0
-            theta = - np.arctan2(pre[1], pre[0]) + np.pi / 2
+                pre = (orig - data['trajs'][0][self.obs_horizon-4]) / 2.0 # 只用了角度，没必要除以2
+            theta = - np.arctan2(pre[1], pre[0]) + np.pi / 2  # 这个旋转不用加pi/2,但只要所有的数据统一加或不加就都可以
             rot = np.asarray([
                 [np.cos(theta), -np.sin(theta)],
                 [np.sin(theta), np.cos(theta)]], np.float32)
@@ -173,19 +219,21 @@ class ArgoversePreprocessor(Dataset):
                 [1.0, 0.0],
                 [0.0, 1.0]], np.float32)
 
-        # get the target candidates and candidate gt
-        # agt_traj_obs没有旋转坐标？
+        # 根据历史轨迹选出可能的车道中心线
         agt_traj_obs = data['trajs'][0][0: self.obs_horizon].copy().astype(np.float32)
-        agt_traj_fut = data['trajs'][0][self.obs_horizon:self.obs_horizon+self.pred_horizon].copy().astype(np.float32)
         ctr_line_candts = self.am.get_candidate_centerlines_for_traj(agt_traj_obs, data['city'], viz=False)
 
-        # rotate the center lines and find the reference center line
+        # 将未来轨迹和车道中心线变换到预测坐标系下（就是前面计算的原点和旋转矩阵）
+        # agt_traj_obs应该也要转换吧？？？？
+        agt_traj_fut = data['trajs'][0][self.obs_horizon:self.obs_horizon+self.pred_horizon].copy().astype(np.float32)
         agt_traj_fut = np.matmul(rot, (agt_traj_fut - orig.reshape(-1, 2)).T).T
         for i, _ in enumerate(ctr_line_candts):
             ctr_line_candts[i] = np.matmul(rot, (ctr_line_candts[i] - orig.reshape(-1, 2)).T).T
 
+        # 采样候选目标点（基于转换后的中心线坐标），在每条中心线上从原点向前每隔0.5m采样一个点
         tar_candts = self.lane_candidate_sampling(ctr_line_candts, [0, 0], viz=False)
 
+        # 如果是训练集和验证集，获取真值（最后一个历史轨迹点的车道、候选目标点及偏移值）
         if self.split == "test":
             tar_candts_gt, tar_offse_gt = np.zeros((tar_candts.shape[0], 1)), np.zeros((1, 2))
             splines, ref_idx = None, None
@@ -195,32 +243,59 @@ class ArgoversePreprocessor(Dataset):
             # 获取真值对应的候选点和offset
             tar_candts_gt, tar_offse_gt = self.get_candidate_gt(tar_candts, agt_traj_fut[-1])
 
+        # 生成特征向量和标签
         feats, ctrs, has_obss, gt_preds, has_preds = [], [], [], [], []
         x_min, x_max, y_min, y_max = -self.obs_range, self.obs_range, -self.obs_range, self.obs_range
+        '''
+        data = {
+            'trajs': [traj1, traj2, traj3, ...],
+            'steps': [step1, step2, step3, ...],
+            'city': 'MIA',
+            ...
+        }
+        '''
         for traj, step in zip(data['trajs'], data['steps']):
+            # traj表示一个目标的轨迹序列， step对应每个轨迹的时间步索引（时间戳对应的 step 索引）
             if self.obs_horizon-1 not in step:
+                # 轨迹不够长的滤除
                 continue
 
-            # normalize and rotate
+            # 对轨迹进行坐标转换，包括历史轨迹和未来轨迹（与前面的转换有点重复，浪费算力了！！！）
             traj_nd = np.matmul(rot, (traj - orig.reshape(-1, 2)).T).T
 
-            # collect the future prediction ground truth
+            # 获取预测轨迹真值
+            # gt_pred 用于保存预测阶段的真实轨迹 (ground truth)
             gt_pred = np.zeros((self.pred_horizon, 2), np.float32)
+            # has_pred 是一个布尔掩码，表示该时间步是否存在有效的 ground truth
             has_pred = np.zeros(self.pred_horizon, np.bool_)
-            future_mask = np.logical_and(step >= self.obs_horizon, step < self.obs_horizon + self.pred_horizon)
+            # 生成一个布尔掩码（mask），future_mask 为 True 的元素表示该点属于“预测阶段”
+            future_mask = np.logical_and(
+                step >= self.obs_horizon,
+                step < self.obs_horizon + self.pred_horizon
+            )
+            # 取出这些未来帧对应的 step 值，并把时间归一化到(0, pred_horizon-1)
             post_step = step[future_mask] - self.obs_horizon
+            # 取出这些未来帧对应的 (x, y) 坐标
             post_traj = traj_nd[future_mask]
+            # 把这些真实轨迹放入 gt_pred 中对应的位置
             gt_pred[post_step] = post_traj
+            # 标记这些时间步的预测目标存在
             has_pred[post_step] = True
 
-            # colect the observation
+            # 获取观测轨迹
+            # 生成一个布尔掩码（mask），obs_mask 为 True 的元素表示该点属于观测阶段
             obs_mask = step < self.obs_horizon
+            # 取出观测阶段的时间步
             step_obs = step[obs_mask]
+            # 取出观测窗口的轨迹坐标
             traj_obs = traj_nd[obs_mask]
+            # 有时候原始 CSV 中的时间戳不是升序的，所以这里进行排序
             idcs = step_obs.argsort()
+            # 根据排序结果重排时间步和轨迹，保证按时间顺序排列
             step_obs = step_obs[idcs]
             traj_obs = traj_obs[idcs]
 
+            # 用于对齐轨迹，但似乎有点奇怪（后续再细看！！！！）
             for i in range(len(step_obs)):
                 if step_obs[i] == self.obs_horizon - len(step_obs) + i:
                     break
@@ -248,9 +323,13 @@ class ArgoversePreprocessor(Dataset):
         # if len(feats) < 1:
         #     raise Exception()
 
+        # feats是所有目标的观测轨迹
         feats = np.asarray(feats, np.float32)
+        # has_obss标记所有目标的这些时间步的观测目标存在
         has_obss = np.asarray(has_obss, np.bool_)
+        # gt_preds是所有目标的预测轨迹真值
         gt_preds = np.asarray(gt_preds, np.float32)
+        # has_preds标记所有目标的这些时间步的预测目标存在
         has_preds = np.asarray(has_preds, np.bool_)
 
         # plot the splines
@@ -268,9 +347,9 @@ class ArgoversePreprocessor(Dataset):
 
         data['feats'] = feats
         data['has_obss'] = has_obss
-
-        data['has_preds'] = has_preds
         data['gt_preds'] = gt_preds
+        data['has_preds'] = has_preds
+        
         data['tar_candts'] = tar_candts
         data['gt_candts'] = tar_candts_gt
         data['gt_tar_offset'] = tar_offse_gt
@@ -283,36 +362,43 @@ class ArgoversePreprocessor(Dataset):
         """Get a rectangle area defined by pred_range."""
         x_min, x_max, y_min, y_max = -self.obs_range, self.obs_range, -self.obs_range, self.obs_range
         radius = max(abs(x_min), abs(x_max)) + max(abs(y_min), abs(y_max))
+        # 根据给定的二维坐标（或轨迹）和一个矩形范围（bbox），返回该范围内的所有车道 ID（lane_id）列表
+        # box的长宽都是2 × query_search_range_m
         lane_ids = self.am.get_lane_ids_in_xy_bbox(data['orig'][0], data['orig'][1], data['city'], radius * 1.5)
-        lane_ids = copy.deepcopy(lane_ids)
+        lane_ids = copy.deepcopy(lane_ids) # 单纯出于安全性和可读性考虑，是冗余的
 
+        # 更新车道中心线和包络为预测坐标系下的坐标，并滤除观测范围外的车道
         lanes = dict()
         for lane_id in lane_ids:
+            # 获取车道属性，city_lane_centerlines_dict返回的是城市/lane_id/道路属性这样层级的字典
             lane = self.am.city_lane_centerlines_dict[data['city']][lane_id]
-            lane = copy.deepcopy(lane)
-
+            lane = copy.deepcopy(lane) # 单纯出于安全性和可读性考虑，是冗余的
+            # 车道中心线转换到预测坐标系下
             centerline = np.matmul(data['rot'], (lane.centerline - data['orig'].reshape(-1, 2)).T).T
+            # 冗余的保护措施，确保车道是在指定范围
             x, y = centerline[:, 0], centerline[:, 1]
             if x.max() < x_min or x.min() > x_max or y.max() < y_min or y.min() > y_max:
                 continue
             else:
                 """Getting polygons requires original centerline"""
+                # 获取车道的包络点
                 polygon = self.am.get_lane_segment_polygon(lane_id, data['city'])
                 polygon = copy.deepcopy(polygon)
+                # 将车道中心线和包络更新为坐标转换后的并添加到lanes里
                 lane.centerline = centerline
                 lane.polygon = np.matmul(data['rot'], (polygon[:, :2] - data['orig'].reshape(-1, 2)).T).T
                 lanes[lane_id] = lane
-
+        # 获取地图特征
         lane_ids = list(lanes.keys())
         ctrs, feats, turn, control, intersect = [], [], [], [], []
         for lane_id in lane_ids:
             lane = lanes[lane_id]
+            # 车道中心线每段的中心点，方向
             ctrln = lane.centerline
-            num_segs = len(ctrln) - 1
-
             ctrs.append(np.asarray((ctrln[:-1] + ctrln[1:]) / 2.0, np.float32))
             feats.append(np.asarray(ctrln[1:] - ctrln[:-1], np.float32))
-
+            # 车道的转向类型
+            num_segs = len(ctrln) - 1 # 节点数是车道中心线线段的数量
             x = np.zeros((num_segs, 2), np.float32)
             if lane.turn_direction == 'LEFT':
                 x[:, 0] = 1
@@ -321,7 +407,7 @@ class ArgoversePreprocessor(Dataset):
             else:
                 pass
             turn.append(x)
-
+            # 是否有红绿灯和是否在路口
             control.append(lane.has_traffic_control * np.ones(num_segs, np.float32))
             intersect.append(lane.is_intersection * np.ones(num_segs, np.float32))
 
@@ -330,8 +416,8 @@ class ArgoversePreprocessor(Dataset):
         for i, ctr in enumerate(ctrs):
             lane_idcs.append(i * np.ones(len(ctr), np.int64))
             count += len(ctr)
-        num_nodes = count
-        lane_idcs = np.concatenate(lane_idcs, 0)
+        num_nodes = count # 所有车道线段中点的总数
+        lane_idcs = np.concatenate(lane_idcs, 0)  # 每个节点对应的车道编号（长度 = 总节点数）
 
         graph = dict()
         graph['ctrs'] = np.concatenate(ctrs, 0)
@@ -359,12 +445,19 @@ class ArgoversePreprocessor(Dataset):
     def lane_candidate_sampling(self, centerline_list, orig, distance=0.5, viz=False):
         """the input are list of lines, each line containing"""
         candidates = []
+        # 分别对可能到达的车道进行候选点采样
         for lane_id, line in enumerate(centerline_list):
+            # 车道中心线拟合三次样条曲线
             sp = Spline2D(x=line[:, 0], y=line[:, 1])
+            # 计算坐标原点的纵向和横向位置（只需要纵向位置）
             s_o, d_o = sp.calc_frenet_position(orig[0], orig[1])
+            # 纵向每0.5m采一个点
             s = np.arange(s_o, sp.s[-1], distance)
+            # 计算每个采样点的x和y坐标
             ix, iy = sp.calc_global_position_online(s)
+            # 拼成Nx2维
             candidates.append(np.stack([ix, iy], axis=1))
+        # 将每条车道的候选点整合到一起成为N_total x 2,然后还要去重
         candidates = np.unique(np.concatenate(candidates), axis=0)
 
         if viz:
